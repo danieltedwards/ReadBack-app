@@ -161,7 +161,9 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
         <option value="2">2×</option>
       </select>
       <select id="voice" class="voice" aria-label="Voice"></select>
+      <label class="count"><input type="checkbox" id="allVoices"> All languages</label>
     </div>
+    <div class="count" id="langNote" role="status"></div>
   </div>
 </div>
 
@@ -177,6 +179,7 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
   var state = 'stopped';   // stopped | playing | paused
   var token = 0;           // invalidates stale utterance callbacks
   var voices = [];
+  var docLang = 'en';
 
   if (window.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -230,7 +233,9 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
     $('docBadge').hidden = !isSample;
     var words = sents.reduce(function (n, s) { return n + s.text.split(/\s+/).length; }, 0);
     var mins = Math.max(1, Math.round(words / (160 * parseFloat($('rate').value))));
-    $('docMeta').textContent = words.toLocaleString() + ' words · about ' + mins + ' min';
+    docLang = detectLang(sents.map(function (s) { return s.text; }).join(' '));
+    $('docMeta').textContent = langName(docLang) + ' · ' + words.toLocaleString() + ' words · about ' + mins + ' min';
+    if (synth) fillVoices();
     mark(); updateUi();
   }
 
@@ -269,7 +274,10 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
     setTimeout(function () {
       if (my !== token || state !== 'playing') return;
       var u = new SpeechSynthesisUtterance(sents[idx].text);
-      var v = currentVoice(); if (v) { u.voice = v; u.lang = v.lang; }
+      var v = currentVoice();
+      if (v && vlang(v) === docLang) { u.voice = v; u.lang = v.lang; }
+      else if (v && $('allVoices').checked) { u.voice = v; u.lang = v.lang; }
+      else { u.lang = docLang; }
       u.rate = parseFloat($('rate').value);
       u.onend = function () {
         if (my !== token || state !== 'playing') return;
@@ -308,23 +316,65 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
   $('voice').onchange = function () { save('rb-voice', this.value); if (state === 'playing') speakCurrent(); };
   window.addEventListener('pagehide', function () { if (synth) synth.cancel(); });
 
+  /* ---------- language detection ---------- */
+  var STOP = {
+    en: 'the and of to in is that it for with as was on are be this have not you at by from or an',
+    es: 'el la de que y en los las del un una por con para es se no al lo como más pero su',
+    fr: 'le la les des et est un une du que pour dans qui pas sur ce il elle au avec ne se',
+    de: 'der die das und ist nicht ein eine zu den mit von für auf dem sich auch es im',
+    pt: 'o a os as de que e do da em um uma para com não se na no por mais como mas',
+    it: 'il lo la di che e un una per con non sono del della in è le gli si più come',
+    nl: 'de het een en van ik dat niet is op te voor met zijn er maar om ook aan'
+  };
+  Object.keys(STOP).forEach(function (k) { var o = {}; STOP[k].split(' ').forEach(function (w) { o[w] = 1; }); STOP[k] = o; });
+  function detectLang(text) {
+    var s = text.slice(0, 5000);
+    var c = function (re) { return (s.match(re) || []).length; };
+    if (c(/[぀-ヿ]/g) > 5) return 'ja';
+    if (c(/[가-힯]/g) > 5) return 'ko';
+    if (c(/[一-鿿]/g) > 5) return 'zh';
+    if (c(/[Ѐ-ӿ]/g) > 5) return 'ru';
+    if (c(/[؀-ۿ]/g) > 5) return 'ar';
+    if (c(/[֐-׿]/g) > 5) return 'he';
+    if (c(/[ऀ-ॿ]/g) > 5) return 'hi';
+    if (c(/[฀-๿]/g) > 5) return 'th';
+    if (c(/[Ͱ-Ͽ]/g) > 5) return 'el';
+    var words = s.toLowerCase().match(/[a-zà-ÿ']+/g) || [];
+    var best = 'en', top = 0;
+    Object.keys(STOP).forEach(function (k) {
+      var n = 0; words.forEach(function (w) { if (STOP[k][w]) n++; });
+      if (n > top) { top = n; best = k; }
+    });
+    return best;
+  }
+  function langName(code) {
+    try { return new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code); } catch (e) { return code; }
+  }
+  function vlang(v) { return v.lang.toLowerCase().replace('_', '-').split('-')[0]; }
+
   function fillVoices() {
     if (!synth) { $('voice').innerHTML = '<option>No speech support</option>'; $('voice').disabled = true; return; }
     voices = synth.getVoices();
     if (!voices.length) return;
     var saved = load('rb-voice');
-    var lang = (navigator.language || 'en').slice(0, 2);
-    var list = voices.slice().sort(function (a, b) {
-      var al = a.lang.indexOf(lang) === 0 ? 0 : 1, bl = b.lang.indexOf(lang) === 0 ? 0 : 1;
-      return al - bl || a.name.localeCompare(b.name);
+    var all = $('allVoices').checked;
+    var match = voices.filter(function (v) { return vlang(v) === docLang; });
+    var list = (all || !match.length) ? voices.slice() : match;
+    list.sort(function (a, b) {
+      var am = vlang(a) === docLang ? 0 : 1, bm = vlang(b) === docLang ? 0 : 1;
+      return am - bm || a.name.localeCompare(b.name);
     });
     var sel = $('voice'); sel.textContent = '';
     list.forEach(function (v) {
       var o = document.createElement('option'); o.value = v.voiceURI; o.textContent = v.name + ' (' + v.lang + ')'; sel.appendChild(o);
     });
-    var pick = list.filter(function (v) { return v.voiceURI === saved; })[0] || list.filter(function (v) { return v.default && v.lang.indexOf(lang) === 0; })[0] || list[0];
+    var pick = list.filter(function (v) { return v.voiceURI === saved && vlang(v) === docLang; })[0]
+      || list.filter(function (v) { return v.default && vlang(v) === docLang; })[0]
+      || list.filter(function (v) { return vlang(v) === docLang; })[0] || list[0];
     sel.value = pick.voiceURI;
+    $('langNote').textContent = match.length ? '' : 'No ' + langName(docLang) + ' voice is installed on this device, so it will sound accented. Add one in your device’s speech settings.';
   }
+  $('allVoices').onchange = function () { fillVoices(); if (state === 'playing') speakCurrent(); };
   if (synth) { fillVoices(); synth.onvoiceschanged = fillVoices; } else { fillVoices(); }
   var sr = load('rb-rate'); if (sr) $('rate').value = sr;
 
