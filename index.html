@@ -129,6 +129,11 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
       <textarea id="paste" placeholder="Paste anything you want read aloud"></textarea>
       <div class="paste-row"><button class="btn" id="pasteGo" type="button">Use this text</button></div>
     </details>
+    <details style="width:100%">
+      <summary>Translation settings</summary>
+      <p>Translation uses your browser's built-in translator when it has one, otherwise a free online service with a daily limit. An email address raises that limit and is sent only to that service.</p>
+      <input id="email" type="email" placeholder="you@example.com" autocomplete="email" style="margin-top:8px;width:100%;max-width:320px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit">
+    </details>
     <p id="status" role="status" aria-live="polite"></p>
   </section>
 
@@ -152,6 +157,8 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
       <span class="count grow" id="count" style="text-align:right"></span>
     </div>
     <div class="ctrl">
+      <label class="count" for="target">Read in</label>
+      <select id="target"></select>
       <label class="count" for="rate">Speed</label>
       <select id="rate">
         <option value="0.75">0.75×</option>
@@ -180,6 +187,8 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
   var token = 0;           // invalidates stale utterance callbacks
   var voices = [];
   var docLang = 'en';
+  var target = '';          // '' = read in the document's own language
+  function effLang() { return target || docLang; }
 
   if (window.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -273,11 +282,17 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
     synth.cancel();
     setTimeout(function () {
       if (my !== token || state !== 'playing') return;
-      var u = new SpeechSynthesisUtterance(sents[idx].text);
+      var i0 = idx;
+      var pending = target && target !== docLang;
+      if (pending) say('Translating…');
+      getTr(i0, target).then(function (text) {
+      if (my !== token || state !== 'playing') return;
+      if (pending) say('');
+      for (var k = 1; k <= 4; k++) if (i0 + k < sents.length) getTr(i0 + k, target).catch(function () {});
+      var u = new SpeechSynthesisUtterance(text);
+      var L = effLang();
       var v = currentVoice();
-      if (v && vlang(v) === docLang) { u.voice = v; u.lang = v.lang; }
-      else if (v && $('allVoices').checked) { u.voice = v; u.lang = v.lang; }
-      else { u.lang = docLang; }
+      if (v && (vlang(v) === L || $('allVoices').checked)) { u.voice = v; u.lang = v.lang; } else { u.lang = L; }
       u.rate = parseFloat($('rate').value);
       u.onend = function () {
         if (my !== token || state !== 'playing') return;
@@ -290,6 +305,11 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
         state = 'stopped'; updateUi(); say('Speech failed: ' + (e.error || 'unknown error') + '. Try a different voice.', true);
       };
       synth.speak(u);
+      }).catch(function (e) {
+        if (my !== token) return;
+        state = 'stopped'; updateUi();
+        say((e && e.message) ? e.message : 'Translation failed.', true);
+      });
     }, 30);
     mark();
   }
@@ -358,22 +378,91 @@ select { background: var(--surface); border: 1px solid var(--line); border-radiu
     if (!voices.length) return;
     var saved = load('rb-voice');
     var all = $('allVoices').checked;
-    var match = voices.filter(function (v) { return vlang(v) === docLang; });
+    var L = effLang();
+    var match = voices.filter(function (v) { return vlang(v) === L; });
     var list = (all || !match.length) ? voices.slice() : match;
     list.sort(function (a, b) {
-      var am = vlang(a) === docLang ? 0 : 1, bm = vlang(b) === docLang ? 0 : 1;
+      var am = vlang(a) === L ? 0 : 1, bm = vlang(b) === L ? 0 : 1;
       return am - bm || a.name.localeCompare(b.name);
     });
     var sel = $('voice'); sel.textContent = '';
     list.forEach(function (v) {
       var o = document.createElement('option'); o.value = v.voiceURI; o.textContent = v.name + ' (' + v.lang + ')'; sel.appendChild(o);
     });
-    var pick = list.filter(function (v) { return v.voiceURI === saved && vlang(v) === docLang; })[0]
-      || list.filter(function (v) { return v.default && vlang(v) === docLang; })[0]
-      || list.filter(function (v) { return vlang(v) === docLang; })[0] || list[0];
+    var pick = list.filter(function (v) { return v.voiceURI === saved && vlang(v) === L; })[0]
+      || list.filter(function (v) { return v.default && vlang(v) === L; })[0]
+      || list.filter(function (v) { return vlang(v) === L; })[0] || list[0];
     sel.value = pick.voiceURI;
-    $('langNote').textContent = match.length ? '' : 'No ' + langName(docLang) + ' voice is installed on this device, so it will sound accented. Add one in your device’s speech settings.';
+    $('langNote').textContent = match.length ? '' : 'No ' + langName(L) + ' voice is installed on this device, so it will sound accented. Add one in your device’s speech settings.';
   }
+
+  /* ---------- translation ---------- */
+  var nativeTr = {};
+  async function nativeTranslate(text, from, to) {
+    if (!('Translator' in self)) return null;
+    var key = from + '>' + to;
+    if (!(key in nativeTr)) {
+      try {
+        var wait = function (ms) { return new Promise(function (r) { setTimeout(function () { r('timeout'); }, ms); }); };
+        var av = await Promise.race([Translator.availability({ sourceLanguage: from, targetLanguage: to }), wait(1500)]);
+        // only use it when the language pack is already on the device; a download could stall
+        nativeTr[key] = av === 'available' ? await Promise.race([Translator.create({ sourceLanguage: from, targetLanguage: to }), wait(3000)]) : null;
+        if (nativeTr[key] === 'timeout') nativeTr[key] = null;
+      } catch (e) { nativeTr[key] = null; }
+    }
+    return nativeTr[key] ? nativeTr[key].translate(text) : null;
+  }
+  function decodeHtml(s) { var t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
+  async function webTranslate(text, from, to) {
+    var map = function (c) { return c === 'zh' ? 'zh-CN' : c; };
+    var u = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + map(from) + '|' + map(to);
+    var em = load('rb-email'); if (em) u += '&de=' + encodeURIComponent(em);
+    var j;
+    try { var r = await fetch(u); j = await r.json(); }
+    catch (e) { throw new Error('Could not reach the translation service. Check your connection and try again.'); }
+    if (String(j.responseStatus) !== '200') {
+      var d = (j.responseDetails || '');
+      if (/ALL AVAILABLE FREE TRANSLATIONS/i.test(d)) throw new Error('The free translation limit for today is used up. Add your email under Translation settings to raise it, or try again tomorrow.');
+      throw new Error('Translation failed: ' + d);
+    }
+    return decodeHtml(j.responseData.translatedText);
+  }
+  async function translateText(text, from, to) {
+    var n = null;
+    try { n = await nativeTranslate(text, from, to); } catch (e) { n = null; }
+    return n || webTranslate(text, from, to);
+  }
+  function showSent(i) {
+    var s = sents[i]; if (!s) return;
+    s.el.textContent = (target && s.tr && s.tr[target]) ? s.tr[target] : s.text;
+  }
+  function getTr(i, t) {
+    var s = sents[i];
+    if (!t || t === docLang) return Promise.resolve(s.text);
+    s.trp = s.trp || {}; s.tr = s.tr || {};
+    if (!s.trp[t]) {
+      s.trp[t] = translateText(s.text, docLang, t).then(function (x) {
+        s.tr[t] = x; if (t === target) showSent(i); return x;
+      }).catch(function (e) { delete s.trp[t]; throw e; });
+    }
+    return s.trp[t];
+  }
+  var LANGS = ['', 'en', 'es', 'fr', 'de', 'pt', 'it', 'nl', 'ru', 'zh', 'ja', 'ko', 'ar', 'hi'];
+  (function () {
+    var sel = $('target');
+    LANGS.forEach(function (c) {
+      var o = document.createElement('option'); o.value = c; o.textContent = c ? langName(c) : 'Original language'; sel.appendChild(o);
+    });
+    var sv = load('rb-target'); if (sv && LANGS.indexOf(sv) > -1) { sel.value = sv; target = sv; }
+  })();
+  $('target').onchange = function () {
+    target = this.value; save('rb-target', target);
+    sents.forEach(function (s, i) { showSent(i); });
+    fillVoices(); say('');
+    if (state === 'playing') speakCurrent();
+  };
+  $('email').value = load('rb-email') || '';
+  $('email').onchange = function () { save('rb-email', this.value.trim()); };
   $('allVoices').onchange = function () { fillVoices(); if (state === 'playing') speakCurrent(); };
   if (synth) { fillVoices(); synth.onvoiceschanged = fillVoices; } else { fillVoices(); }
   var sr = load('rb-rate'); if (sr) $('rate').value = sr;
